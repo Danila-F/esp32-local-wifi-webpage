@@ -1,0 +1,94 @@
+name: Build ESP32 firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO and esptool
+        run: python -m pip install --upgrade platformio esptool
+
+      - name: Build firmware
+        run: pio run -e nodemcu-32s
+
+      - name: Prepare output files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_DIR=".pio/build/nodemcu-32s"
+          OUT_DIR="output"
+          mkdir -p "$OUT_DIR"
+
+          cp "$BUILD_DIR/firmware.bin" "$OUT_DIR/firmware.bin"
+          cp "$BUILD_DIR/partitions.bin" "$OUT_DIR/partitions.bin"
+
+          if [ -f "$BUILD_DIR/bootloader.bin" ]; then
+            cp "$BUILD_DIR/bootloader.bin" "$OUT_DIR/bootloader.bin"
+          else
+            BOOTLOADER="$(find "$BUILD_DIR" "$HOME/.platformio/packages" -path '*bootloader*.bin' -type f | head -n 1 || true)"
+            if [ -n "$BOOTLOADER" ]; then
+              cp "$BOOTLOADER" "$OUT_DIR/bootloader.bin"
+            else
+              echo "bootloader.bin not found"
+            fi
+          fi
+
+          BOOT_APP0="$(find "$HOME/.platformio/packages" -path '*boot_app0.bin' -type f | head -n 1 || true)"
+          if [ -n "$BOOT_APP0" ]; then
+            cp "$BOOT_APP0" "$OUT_DIR/boot_app0.bin"
+          else
+            echo "boot_app0.bin not found; continuing without it"
+          fi
+
+          cat > "$OUT_DIR/FLASH_ADDRESSES.txt" <<'EOF'
+          Single app-only flash:
+            firmware.bin       -> 0x10000
+
+          Full multi-file flash:
+            bootloader.bin     -> 0x1000
+            partitions.bin     -> 0x8000
+            boot_app0.bin      -> 0xe000
+            firmware.bin       -> 0x10000
+
+          Merged image:
+            merged-flash.bin   -> 0x0
+          EOF
+
+          if [ -f "$OUT_DIR/bootloader.bin" ] && [ -f "$OUT_DIR/boot_app0.bin" ]; then
+            python -m esptool --chip esp32 merge_bin \
+              -o "$OUT_DIR/merged-flash.bin" \
+              --flash_mode dio \
+              --flash_freq 80m \
+              --flash_size 4MB \
+              0x1000 "$OUT_DIR/bootloader.bin" \
+              0x8000 "$OUT_DIR/partitions.bin" \
+              0xe000 "$OUT_DIR/boot_app0.bin" \
+              0x10000 "$OUT_DIR/firmware.bin"
+          else
+            echo "Skipping merged-flash.bin: bootloader.bin or boot_app0.bin is missing"
+          fi
+
+          sha256sum "$OUT_DIR"/* > "$OUT_DIR/SHA256SUMS.txt"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-gpio2-blink-firmware
+          path: output/
+          retention-days: 14
