@@ -4,6 +4,7 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <Update.h>
 
 #define LED_PIN 2
 #define RESET_BUTTON_PIN 0
@@ -21,6 +22,7 @@ Preferences preferences;
 
 bool setupMode = false;
 String setupReason;
+bool otaUpdateOk = false;
 
 unsigned long resetButtonPressedAt = 0;
 bool resetButtonHandled = false;
@@ -139,6 +141,9 @@ String css() {
     .muted {
       color: #666;
     }
+    .warning {
+      color: #9a4b00;
+    }
   )rawliteral";
 }
 
@@ -218,12 +223,55 @@ String makeMainPage() {
 
   html += R"rawliteral(
     <p><a class="button secondary" href="/status">JSON статус</a></p>
+    <p><a class="button secondary" href="/ota">OTA обновление прошивки</a></p>
     <p><a class="button secondary" href="/reset-wifi" onclick="return confirm('Стереть Wi-Fi настройки и перезагрузить ESP32?')">Стереть Wi-Fi настройки</a></p>
 
     <p class="muted">
       Также можно стереть настройки, удерживая кнопку IO0/BOOT около 5 секунд после обычного запуска ESP32.
       Не держи IO0 во время нажатия EN, иначе плата уйдёт в bootloader mode.
     </p>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+String makeOtaPage() {
+  String html = R"rawliteral(
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 OTA Update</title>
+  <style>
+)rawliteral";
+
+  html += css();
+
+  html += R"rawliteral(
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>OTA обновление ESP32</h1>
+
+    <p>Выбери файл <code>firmware.bin</code>, собранный GitHub Actions.</p>
+
+    <p class="warning">
+      Не загружай сюда <code>merged-flash.bin</code>. Он предназначен для полной прошивки через USB/UART по адресу <code>0x0</code>.
+    </p>
+
+    <form method="POST" action="/update" enctype="multipart/form-data">
+      <label for="firmware">Файл прошивки</label>
+      <input id="firmware" name="firmware" type="file" accept=".bin" required>
+
+      <button type="submit">Загрузить и установить</button>
+    </form>
+
+    <p><a class="button secondary" href="/">Назад</a></p>
   </div>
 </body>
 </html>
@@ -275,6 +323,104 @@ void handleMainRoot() {
   digitalWrite(LED_PIN, LOW);
 }
 
+void handleOtaPage() {
+  if (setupMode) {
+    server.send(403, "text/plain; charset=utf-8", "OTA update is disabled in setup mode");
+    return;
+  }
+
+  server.send(200, "text/html; charset=utf-8", makeOtaPage());
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUpdateOk = false;
+
+    Serial.println();
+    Serial.print("OTA update started. File: ");
+    Serial.println(upload.filename);
+
+    digitalWrite(LED_PIN, HIGH);
+
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      Serial.println("Update.begin() failed");
+      Update.printError(Serial);
+    }
+  }
+
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!Update.hasError()) {
+      size_t written = Update.write(upload.buf, upload.currentSize);
+
+      if (written != upload.currentSize) {
+        Serial.println("Update.write() failed");
+        Update.printError(Serial);
+      }
+    }
+  }
+
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      otaUpdateOk = true;
+
+      Serial.println();
+      Serial.print("OTA update finished. Size: ");
+      Serial.print(upload.totalSize);
+      Serial.println(" bytes");
+    } else {
+      otaUpdateOk = false;
+
+      Serial.println();
+      Serial.println("Update.end() failed");
+      Update.printError(Serial);
+    }
+
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  else if (upload.status == UPLOAD_FILE_ABORTED) {
+    otaUpdateOk = false;
+    Update.abort();
+
+    Serial.println();
+    Serial.println("OTA update aborted");
+
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+void handleOtaFinished() {
+  server.sendHeader("Connection", "close");
+
+  if (otaUpdateOk) {
+    server.send(
+      200,
+      "text/html; charset=utf-8",
+      "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
+      "<h1>OTA обновление успешно</h1>"
+      "<p>ESP32 перезагрузится через несколько секунд.</p>"
+      "</html>"
+    );
+
+    Serial.println("Restarting after OTA update...");
+    delay(1500);
+    ESP.restart();
+  } else {
+    server.send(
+      500,
+      "text/html; charset=utf-8",
+      "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
+      "<h1>OTA обновление не удалось</h1>"
+      "<p>Проверь Serial Monitor для подробностей.</p>"
+      "<p>Убедись, что загружаешь именно firmware.bin, а не merged-flash.bin.</p>"
+      "<p><a href=\"/ota\">Назад</a></p>"
+      "</html>"
+    );
+  }
+}
+
 void handleStatus() {
   String json = "{";
   json += "\"mode\":\"";
@@ -284,6 +430,9 @@ void handleStatus() {
   json += "\"local_ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"soft_ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"sketch_size\":" + String(ESP.getSketchSize()) + ",";
+  json += "\"free_sketch_space\":" + String(ESP.getFreeSketchSpace()) + ",";
   json += "\"uptime_ms\":" + String(millis());
   json += "}";
 
@@ -354,6 +503,8 @@ void startMainServer() {
 
   server.on("/", HTTP_GET, handleMainRoot);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/ota", HTTP_GET, handleOtaPage);
+  server.on("/update", HTTP_POST, handleOtaFinished, handleOtaUpload);
   server.on("/reset-wifi", HTTP_GET, handleResetWiFi);
   server.onNotFound(handleNotFound);
 
@@ -363,6 +514,9 @@ void startMainServer() {
   Serial.print("Open in browser: http://");
   Serial.print(WiFi.localIP());
   Serial.println("/");
+  Serial.print("OTA page: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/ota");
 }
 
 void startSetupPortal(const String& reason) {
