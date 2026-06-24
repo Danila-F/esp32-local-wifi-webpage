@@ -95,13 +95,8 @@ static bool isBleConnected() {
 }
 
 static void disconnectBle() {
-  if (bleClient != nullptr) {
-    if (bleClient->isConnected()) {
-      bleClient->disconnect();
-    }
-
-    BLEDevice::deleteClient(bleClient);
-    bleClient = nullptr;
+  if (bleClient != nullptr && bleClient->isConnected()) {
+    bleClient->disconnect();
   }
 
   bleCharacteristic = nullptr;
@@ -187,7 +182,10 @@ static bool connectBle(const String& address, const String& serviceUuid, const S
 
   disconnectBle();
 
-  bleClient = BLEDevice::createClient();
+  if (bleClient == nullptr) {
+    bleClient = BLEDevice::createClient();
+  }
+
   BLEAddress bleAddr(address.c_str());
 
   Serial.print("Connecting to BLE device: ");
