@@ -2,13 +2,7 @@
 #include <WebServer.h>
 #include <vector>
 
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-#include <BLEClient.h>
-#include <BLERemoteService.h>
-#include <BLERemoteCharacteristic.h>
+#include <NimBLEDevice.h>
 
 #include "bluetooth_web.h"
 
@@ -30,8 +24,8 @@ static bool bleInitialized = false;
 static bool bleScanning = false;
 static std::vector<BleDeviceInfo> bleDevices;
 
-static BLEClient* bleClient = nullptr;
-static BLERemoteCharacteristic* bleCharacteristic = nullptr;
+static NimBLEClient* bleClient = nullptr;
+static NimBLERemoteCharacteristic* bleCharacteristic = nullptr;
 
 static String bleAddress;
 static String bleServiceUuid;
@@ -86,7 +80,8 @@ static void ensureBleInitialized() {
     return;
   }
 
-  BLEDevice::init("ESP32-Web-BLE");
+  NimBLEDevice::init("ESP32-Web-BLE");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   bleInitialized = true;
 }
 
@@ -105,13 +100,13 @@ static void disconnectBle() {
   bleCharacteristicUuid = "";
 }
 
-class WebBleAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+class WebBleAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
     BleDeviceInfo info;
-    info.address = String(advertisedDevice.getAddress().toString().c_str());
-    info.name = advertisedDevice.haveName() ? String(advertisedDevice.getName().c_str()) : String("<без имени>");
-    info.rssi = advertisedDevice.getRSSI();
-    info.serviceUuid = advertisedDevice.haveServiceUUID() ? String(advertisedDevice.getServiceUUID().toString().c_str()) : String("");
+    info.address = String(advertisedDevice->getAddress().toString().c_str());
+    info.name = advertisedDevice->haveName() ? String(advertisedDevice->getName().c_str()) : String("<без имени>");
+    info.rssi = advertisedDevice->getRSSI();
+    info.serviceUuid = advertisedDevice->haveServiceUUID() ? String(advertisedDevice->getServiceUUID().toString().c_str()) : String("");
 
     for (const auto& existing : bleDevices) {
       if (existing.address == info.address) {
@@ -125,7 +120,7 @@ class WebBleAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
 
 static WebBleAdvertisedCallbacks scanCallbacks;
 
-static void notifyCallback(BLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
+static void notifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
   String value;
   value.reserve(length);
 
@@ -152,7 +147,7 @@ static bool scanBleDevices() {
   bleLastError = "";
   bleDevices.clear();
 
-  BLEScan* scan = BLEDevice::getScan();
+  NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
   scan->setActiveScan(true);
   scan->setInterval(100);
@@ -183,10 +178,10 @@ static bool connectBle(const String& address, const String& serviceUuid, const S
   disconnectBle();
 
   if (bleClient == nullptr) {
-    bleClient = BLEDevice::createClient();
+    bleClient = NimBLEDevice::createClient();
   }
 
-  BLEAddress bleAddr(address.c_str());
+  NimBLEAddress bleAddr(address.c_str());
 
   Serial.print("Connecting to BLE device: ");
   Serial.println(address);
@@ -197,14 +192,14 @@ static bool connectBle(const String& address, const String& serviceUuid, const S
     return false;
   }
 
-  BLERemoteService* service = bleClient->getService(BLEUUID(serviceUuid.c_str()));
+  NimBLERemoteService* service = bleClient->getService(NimBLEUUID(serviceUuid.c_str()));
   if (service == nullptr) {
     bleLastError = "Service UUID not found on selected BLE device";
     disconnectBle();
     return false;
   }
 
-  bleCharacteristic = service->getCharacteristic(BLEUUID(characteristicUuid.c_str()));
+  bleCharacteristic = service->getCharacteristic(NimBLEUUID(characteristicUuid.c_str()));
   if (bleCharacteristic == nullptr) {
     bleLastError = "Characteristic UUID not found in selected service";
     disconnectBle();
@@ -212,7 +207,7 @@ static bool connectBle(const String& address, const String& serviceUuid, const S
   }
 
   if (bleCharacteristic->canNotify()) {
-    bleCharacteristic->registerForNotify(notifyCallback);
+    bleCharacteristic->subscribe(true, notifyCallback);
   }
 
   bleAddress = address;
@@ -286,8 +281,8 @@ static bool readBle() {
     return false;
   }
 
-  String value = String(bleCharacteristic->readValue().c_str());
-  bleLastRead = value;
+  std::string value = bleCharacteristic->readValue();
+  bleLastRead = String(value.c_str());
   bleLastError = "";
   return true;
 }
