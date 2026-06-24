@@ -16,13 +16,24 @@ struct BleDeviceInfo {
   String serviceUuid;
 };
 
+struct GattCharacteristicInfo {
+  String serviceUuid;
+  String characteristicUuid;
+  String properties;
+  bool readable;
+  bool writable;
+  bool notifiable;
+};
+
 static const int BLE_SCAN_SECONDS = 5;
 static const char DEFAULT_SERVICE_UUID[] = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static const char DEFAULT_CHAR_UUID[] = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 
 static bool bleInitialized = false;
 static bool bleScanning = false;
+static bool gattDiscovered = false;
 static std::vector<BleDeviceInfo> bleDevices;
+static std::vector<GattCharacteristicInfo> gattCharacteristics;
 
 static NimBLEClient* bleClient = nullptr;
 static NimBLERemoteCharacteristic* bleCharacteristic = nullptr;
@@ -40,7 +51,6 @@ static String htmlEscape(const String& value) {
 
   for (size_t i = 0; i < value.length(); i++) {
     char c = value[i];
-
     switch (c) {
       case '&': result += "&amp;"; break;
       case '<': result += "&lt;"; break;
@@ -57,15 +67,15 @@ static String htmlEscape(const String& value) {
 static String pageCss() {
   return R"rawliteral(
     body { font-family: system-ui, sans-serif; margin: 0; padding: 32px; background: #f5f5f5; color: #222; }
-    .card { max-width: 880px; margin: 0 auto 18px; padding: 24px; border-radius: 16px; background: white; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    .card { max-width: 960px; margin: 0 auto 18px; padding: 24px; border-radius: 16px; background: white; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     label { display: block; margin: 14px 0 6px; font-weight: 600; }
     input, textarea { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #bbb; border-radius: 10px; font-size: 16px; }
-    textarea { min-height: 110px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-    button, .button { display: inline-block; margin-top: 14px; padding: 12px 16px; border: 0; border-radius: 10px; background: #222; color: white; font-size: 16px; text-decoration: none; cursor: pointer; }
+    textarea { min-height: 100px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    button, .button { display: inline-block; margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background: #222; color: white; font-size: 15px; text-decoration: none; cursor: pointer; }
     .secondary { background: #eee; color: #222; }
     .danger { background: #8a1f1f; }
-    code { background: #eee; padding: 2px 6px; border-radius: 6px; }
+    code { background: #eee; padding: 2px 6px; border-radius: 6px; word-break: break-all; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; }
     th, td { text-align: left; border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
     .muted { color: #666; }
@@ -76,9 +86,7 @@ static String pageCss() {
 }
 
 static void ensureBleInitialized() {
-  if (bleInitialized) {
-    return;
-  }
+  if (bleInitialized) return;
 
   NimBLEDevice::init("ESP32-Web-BLE");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -86,7 +94,17 @@ static void ensureBleInitialized() {
 }
 
 static bool isBleConnected() {
-  return bleClient != nullptr && bleClient->isConnected() && bleCharacteristic != nullptr;
+  return bleClient != nullptr && bleClient->isConnected();
+}
+
+static bool hasSelectedCharacteristic() {
+  return isBleConnected() && bleCharacteristic != nullptr;
+}
+
+static void clearSelectedCharacteristic() {
+  bleCharacteristic = nullptr;
+  bleServiceUuid = "";
+  bleCharacteristicUuid = "";
 }
 
 static void disconnectBle() {
@@ -94,10 +112,119 @@ static void disconnectBle() {
     bleClient->disconnect();
   }
 
-  bleCharacteristic = nullptr;
+  clearSelectedCharacteristic();
   bleAddress = "";
-  bleServiceUuid = "";
-  bleCharacteristicUuid = "";
+  gattCharacteristics.clear();
+  gattDiscovered = false;
+}
+
+static String characteristicProperties(NimBLERemoteCharacteristic* chr) {
+  String props;
+  if (chr->canRead()) props += "read ";
+  if (chr->canWrite()) props += "write ";
+  if (chr->canWriteNoResponse()) props += "write-no-response ";
+  if (chr->canNotify()) props += "notify ";
+  if (chr->canIndicate()) props += "indicate ";
+  if (chr->canBroadcast()) props += "broadcast ";
+  props.trim();
+  if (props.length() == 0) props = "-";
+  return props;
+}
+
+static bool discoverGatt() {
+  gattCharacteristics.clear();
+  gattDiscovered = false;
+
+  if (!isBleConnected()) {
+    bleLastError = "No BLE device is connected";
+    return false;
+  }
+
+  std::vector<NimBLERemoteService*>* services = bleClient->getServices(true);
+  if (services == nullptr) {
+    bleLastError = "GATT service discovery failed";
+    return false;
+  }
+
+  for (NimBLERemoteService* service : *services) {
+    if (service == nullptr) continue;
+
+    String serviceUuid = String(service->getUUID().toString().c_str());
+    std::vector<NimBLERemoteCharacteristic*>* chars = service->getCharacteristics(true);
+    if (chars == nullptr) continue;
+
+    for (NimBLERemoteCharacteristic* chr : *chars) {
+      if (chr == nullptr) continue;
+
+      GattCharacteristicInfo item;
+      item.serviceUuid = serviceUuid;
+      item.characteristicUuid = String(chr->getUUID().toString().c_str());
+      item.properties = characteristicProperties(chr);
+      item.readable = chr->canRead();
+      item.writable = chr->canWrite() || chr->canWriteNoResponse();
+      item.notifiable = chr->canNotify() || chr->canIndicate();
+      gattCharacteristics.push_back(item);
+    }
+  }
+
+  gattDiscovered = true;
+  if (gattCharacteristics.empty()) {
+    bleLastError = "Connected, but no GATT characteristics discovered";
+    return false;
+  }
+
+  bleLastError = "";
+  return true;
+}
+
+static bool selectCharacteristic(const String& serviceUuid, const String& characteristicUuid) {
+  if (!isBleConnected()) {
+    bleLastError = "No BLE device is connected";
+    return false;
+  }
+
+  if (serviceUuid.length() == 0 || characteristicUuid.length() == 0) {
+    bleLastError = "Service UUID and characteristic UUID are required";
+    return false;
+  }
+
+  NimBLERemoteService* service = bleClient->getService(NimBLEUUID(serviceUuid.c_str()));
+  if (service == nullptr) {
+    bleLastError = "Service UUID not found";
+    clearSelectedCharacteristic();
+    return false;
+  }
+
+  NimBLERemoteCharacteristic* chr = service->getCharacteristic(NimBLEUUID(characteristicUuid.c_str()));
+  if (chr == nullptr) {
+    bleLastError = "Characteristic UUID not found";
+    clearSelectedCharacteristic();
+    return false;
+  }
+
+  bleCharacteristic = chr;
+  bleServiceUuid = serviceUuid;
+  bleCharacteristicUuid = characteristicUuid;
+
+  if (bleCharacteristic->canNotify()) {
+    bleCharacteristic->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* data, size_t length, bool) {
+      String value;
+      value.reserve(length);
+      for (size_t i = 0; i < length; i++) {
+        char c = (char)data[i];
+        if (c >= 32 && c <= 126) value += c;
+        else {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\x%02X", data[i]);
+          value += buf;
+        }
+      }
+      bleLastRead = value;
+    });
+  }
+
+  bleLastError = "";
+  return true;
 }
 
 class WebBleAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
@@ -109,9 +236,7 @@ class WebBleAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     info.serviceUuid = advertisedDevice->haveServiceUUID() ? String(advertisedDevice->getServiceUUID().toString().c_str()) : String("");
 
     for (const auto& existing : bleDevices) {
-      if (existing.address == info.address) {
-        return;
-      }
+      if (existing.address == info.address) return;
     }
 
     bleDevices.push_back(info);
@@ -119,26 +244,6 @@ class WebBleAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 };
 
 static WebBleAdvertisedCallbacks scanCallbacks;
-
-static void notifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
-  String value;
-  value.reserve(length);
-
-  for (size_t i = 0; i < length; i++) {
-    char c = (char)data[i];
-    if (c >= 32 && c <= 126) {
-      value += c;
-    } else {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "\\x%02X", data[i]);
-      value += buf;
-    }
-  }
-
-  bleLastRead = value;
-  Serial.print("BLE notify/read data: ");
-  Serial.println(bleLastRead);
-}
 
 static bool scanBleDevices() {
   ensureBleInitialized();
@@ -153,25 +258,21 @@ static bool scanBleDevices() {
   scan->setInterval(100);
   scan->setWindow(80);
 
-  Serial.println("BLE scan started");
   scan->start(BLE_SCAN_SECONDS, false);
   scan->clearResults();
-  Serial.print("BLE scan finished. Devices: ");
-  Serial.println((int)bleDevices.size());
 
   bleScanning = false;
   return true;
 }
 
-static bool connectBle(const String& address, const String& serviceUuid, const String& characteristicUuid) {
+static bool connectAndDiscover(const String& address) {
   ensureBleInitialized();
-
   bleLastError = "";
   bleLastRead = "";
   bleLastWrite = "";
 
-  if (address.length() == 0 || serviceUuid.length() == 0 || characteristicUuid.length() == 0) {
-    bleLastError = "Address, service UUID and characteristic UUID are required";
+  if (address.length() == 0) {
+    bleLastError = "BLE address is required";
     return false;
   }
 
@@ -182,40 +283,20 @@ static bool connectBle(const String& address, const String& serviceUuid, const S
   }
 
   NimBLEAddress bleAddr(address.c_str());
-
-  Serial.print("Connecting to BLE device: ");
-  Serial.println(address);
-
   if (!bleClient->connect(bleAddr)) {
     bleLastError = "BLE connection failed";
     disconnectBle();
     return false;
   }
 
-  NimBLERemoteService* service = bleClient->getService(NimBLEUUID(serviceUuid.c_str()));
-  if (service == nullptr) {
-    bleLastError = "Service UUID not found on selected BLE device";
-    disconnectBle();
-    return false;
-  }
-
-  bleCharacteristic = service->getCharacteristic(NimBLEUUID(characteristicUuid.c_str()));
-  if (bleCharacteristic == nullptr) {
-    bleLastError = "Characteristic UUID not found in selected service";
-    disconnectBle();
-    return false;
-  }
-
-  if (bleCharacteristic->canNotify()) {
-    bleCharacteristic->subscribe(true, notifyCallback);
-  }
-
   bleAddress = address;
-  bleServiceUuid = serviceUuid;
-  bleCharacteristicUuid = characteristicUuid;
+  discoverGatt();
+  return isBleConnected();
+}
 
-  Serial.println("BLE connected and characteristic selected");
-  return true;
+static bool connectManual(const String& address, const String& serviceUuid, const String& characteristicUuid) {
+  if (!connectAndDiscover(address)) return false;
+  return selectCharacteristic(serviceUuid, characteristicUuid);
 }
 
 static bool parseHex(const String& input, std::vector<uint8_t>& out) {
@@ -224,14 +305,10 @@ static bool parseHex(const String& input, std::vector<uint8_t>& out) {
 
   for (size_t i = 0; i < input.length(); i++) {
     char c = input[i];
-    if (isxdigit((unsigned char)c)) {
-      clean += c;
-    }
+    if (isxdigit((unsigned char)c)) clean += c;
   }
 
-  if (clean.length() == 0 || clean.length() % 2 != 0) {
-    return false;
-  }
+  if (clean.length() == 0 || clean.length() % 2 != 0) return false;
 
   for (size_t i = 0; i < clean.length(); i += 2) {
     char buf[3] = { clean[i], clean[i + 1], 0 };
@@ -242,8 +319,8 @@ static bool parseHex(const String& input, std::vector<uint8_t>& out) {
 }
 
 static bool writeBle(const String& data, bool hexMode) {
-  if (!isBleConnected()) {
-    bleLastError = "No BLE characteristic is connected";
+  if (!hasSelectedCharacteristic()) {
+    bleLastError = "No BLE characteristic is selected";
     return false;
   }
 
@@ -258,7 +335,6 @@ static bool writeBle(const String& data, bool hexMode) {
       bleLastError = "Invalid HEX string";
       return false;
     }
-
     bleCharacteristic->writeValue(bytes.data(), bytes.size(), true);
     bleLastWrite = "HEX bytes sent: " + String(bytes.size());
   } else {
@@ -271,8 +347,8 @@ static bool writeBle(const String& data, bool hexMode) {
 }
 
 static bool readBle() {
-  if (!isBleConnected()) {
-    bleLastError = "No BLE characteristic is connected";
+  if (!hasSelectedCharacteristic()) {
+    bleLastError = "No BLE characteristic is selected";
     return false;
   }
 
@@ -289,33 +365,15 @@ static bool readBle() {
 
 static String makeBluetoothPage() {
   String html = R"rawliteral(
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Bluetooth Console</title>
-  <style>
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ESP32 Bluetooth Console</title><style>
 )rawliteral";
-
   html += pageCss();
-
   html += R"rawliteral(
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Bluetooth / BLE console</h1>
-    <p class="warning">
-      Эта страница работает с BLE GATT-устройствами. Для отправки данных нужно знать Service UUID и Characteristic UUID.
-      Обычные Bluetooth-аудиоустройства, клавиатуры, мыши и произвольные Classic Bluetooth устройства так управляться не будут.
-    </p>
-    <p class="muted">
-      Примеры UUID: Nordic UART Service — service <code>6e400001-b5a3-f393-e0a9-e50e24dcca9e</code>, write characteristic <code>6e400002-b5a3-f393-e0a9-e50e24dcca9e</code>.
-      HM-10-подобные BLE UART часто используют service <code>0000ffe0-0000-1000-8000-00805f9b34fb</code>, characteristic <code>0000ffe1-0000-1000-8000-00805f9b34fb</code>.
-    </p>
+  </style></head><body>
+  <div class="card"><h1>Bluetooth / BLE console</h1>
+    <p class="warning">Работает с BLE GATT. Устройство должно иметь services/characteristics. Bluetooth Classic audio/HID/SPP этим способом не управляется.</p>
     <div class="row">
-      <form method="GET" action="/bt-scan"><button type="submit">Сканировать BLE устройства</button></form>
+      <form method="GET" action="/bt-scan"><button type="submit">Сканировать BLE</button></form>
       <form method="POST" action="/bt-disconnect"><button class="danger" type="submit">Отключиться</button></form>
       <a class="button secondary" href="/">Назад</a>
     </div>
@@ -323,134 +381,134 @@ static String makeBluetoothPage() {
 )rawliteral";
 
   html += "<div class=\"card\"><h2>Статус</h2>";
-  html += "<p><b>BLE:</b> ";
-  html += bleInitialized ? "<code>initialized</code>" : "<code>not initialized</code>";
-  html += "</p>";
-
   html += "<p><b>Connection:</b> ";
   html += isBleConnected() ? "<span class=\"ok\">connected</span>" : "<span class=\"muted\">not connected</span>";
   html += "</p>";
 
-  if (isBleConnected()) {
-    html += "<p><b>Address:</b> <code>" + htmlEscape(bleAddress) + "</code></p>";
-    html += "<p><b>Service UUID:</b> <code>" + htmlEscape(bleServiceUuid) + "</code></p>";
-    html += "<p><b>Characteristic UUID:</b> <code>" + htmlEscape(bleCharacteristicUuid) + "</code></p>";
+  if (isBleConnected()) html += "<p><b>Address:</b> <code>" + htmlEscape(bleAddress) + "</code></p>";
+  if (hasSelectedCharacteristic()) {
+    html += "<p><b>Selected service:</b> <code>" + htmlEscape(bleServiceUuid) + "</code></p>";
+    html += "<p><b>Selected characteristic:</b> <code>" + htmlEscape(bleCharacteristicUuid) + "</code></p>";
   }
-
-  if (bleLastError.length() > 0) {
-    html += "<p class=\"err\"><b>Last error:</b> " + htmlEscape(bleLastError) + "</p>";
-  }
-
-  if (bleLastWrite.length() > 0) {
-    html += "<p><b>Last write:</b> <code>" + htmlEscape(bleLastWrite) + "</code></p>";
-  }
-
-  if (bleLastRead.length() > 0) {
-    html += "<p><b>Last read/notify:</b> <code>" + htmlEscape(bleLastRead) + "</code></p>";
-  }
-
+  if (bleLastError.length() > 0) html += "<p class=\"err\"><b>Last error:</b> " + htmlEscape(bleLastError) + "</p>";
+  if (bleLastWrite.length() > 0) html += "<p><b>Last write:</b> <code>" + htmlEscape(bleLastWrite) + "</code></p>";
+  if (bleLastRead.length() > 0) html += "<p><b>Last read/notify:</b> <code>" + htmlEscape(bleLastRead) + "</code></p>";
   html += "</div>";
 
-  if (isBleConnected()) {
+  if (hasSelectedCharacteristic()) {
     html += R"rawliteral(
-  <div class="card">
-    <h2>Отправка данных</h2>
+  <div class="card"><h2>Отправка данных в выбранную characteristic</h2>
     <form method="POST" action="/bt-send">
-      <label for="data">Данные</label>
-      <textarea id="data" name="data" placeholder="Текст или HEX-строка"></textarea>
+      <label for="data">Данные</label><textarea id="data" name="data" placeholder="Текст или HEX-строка"></textarea>
       <label><input style="width:auto" type="checkbox" name="hex" value="1"> Отправить как HEX, например <code>48656C6C6F0A</code></label>
       <button type="submit">Отправить</button>
     </form>
-    <p><a class="button secondary" href="/bt-read">Прочитать characteristic</a></p>
+    <p><a class="button secondary" href="/bt-read">Read selected characteristic</a></p>
   </div>
 )rawliteral";
   }
 
-  html += "<div class=\"card\"><h2>Найденные устройства</h2>";
-
-  if (bleScanning) {
-    html += "<p>Идёт сканирование...</p>";
-  } else if (bleDevices.empty()) {
-    html += "<p class=\"muted\">Список пуст. Нажми кнопку сканирования.</p>";
-  } else {
-    html += "<table><tr><th>Device</th><th>RSSI</th><th>Advertised service</th><th>Connect</th></tr>";
-
-    for (const auto& device : bleDevices) {
-      html += "<tr><td><b>" + htmlEscape(device.name) + "</b><br><code>" + htmlEscape(device.address) + "</code></td>";
-      html += "<td>" + String(device.rssi) + " dBm</td>";
-      html += "<td><code>" + htmlEscape(device.serviceUuid) + "</code></td>";
-      html += "<td>";
-      html += "<form method=\"POST\" action=\"/bt-connect\">";
-      html += "<input type=\"hidden\" name=\"addr\" value=\"" + htmlEscape(device.address) + "\">";
-      html += "<label>Service UUID</label><input name=\"service\" value=\"" + String(DEFAULT_SERVICE_UUID) + "\">";
-      html += "<label>Characteristic UUID</label><input name=\"char\" value=\"" + String(DEFAULT_CHAR_UUID) + "\">";
-      html += "<button type=\"submit\">Подключиться</button>";
-      html += "</form>";
-      html += "</td></tr>";
+  if (isBleConnected()) {
+    html += "<div class=\"card\"><h2>GATT services / characteristics</h2>";
+    html += "<form method=\"GET\" action=\"/bt-discover\"><button type=\"submit\">Повторить discovery</button></form>";
+    if (!gattDiscovered) {
+      html += "<p class=\"muted\">Discovery ещё не выполнялся.</p>";
+    } else if (gattCharacteristics.empty()) {
+      html += "<p class=\"muted\">Characteristics не найдены или устройство не отдаёт их без pairing.</p>";
+    } else {
+      html += "<table><tr><th>Service UUID</th><th>Characteristic UUID</th><th>Properties</th><th>Action</th></tr>";
+      for (const auto& item : gattCharacteristics) {
+        html += "<tr><td><code>" + htmlEscape(item.serviceUuid) + "</code></td><td><code>" + htmlEscape(item.characteristicUuid) + "</code></td><td>" + htmlEscape(item.properties) + "</td><td>";
+        html += "<form method=\"POST\" action=\"/bt-select\"><input type=\"hidden\" name=\"service\" value=\"" + htmlEscape(item.serviceUuid) + "\"><input type=\"hidden\" name=\"char\" value=\"" + htmlEscape(item.characteristicUuid) + "\"><button type=\"submit\">Выбрать</button></form>";
+        html += "</td></tr>";
+      }
+      html += "</table>";
     }
-
-    html += "</table>";
+    html += "</div>";
   }
 
   html += R"rawliteral(
+  <div class="card"><h2>Ручное подключение / выбор UUID</h2>
+    <form method="POST" action="/bt-connect-manual">
+      <label>BLE address</label><input name="addr" placeholder="aa:bb:cc:dd:ee:ff">
+      <label>Service UUID</label><input name="service" value="6e400001-b5a3-f393-e0a9-e50e24dcca9e">
+      <label>Characteristic UUID</label><input name="char" value="6e400002-b5a3-f393-e0a9-e50e24dcca9e">
+      <button type="submit">Подключиться вручную</button>
+    </form>
+    <p class="muted">Если устройство уже подключено, можно оставить address пустым и выбрать characteristic по UUID через форму ниже.</p>
+    <form method="POST" action="/bt-select">
+      <label>Service UUID</label><input name="service" value="6e400001-b5a3-f393-e0a9-e50e24dcca9e">
+      <label>Characteristic UUID</label><input name="char" value="6e400002-b5a3-f393-e0a9-e50e24dcca9e">
+      <button type="submit">Выбрать UUID на текущем устройстве</button>
+    </form>
   </div>
-</body>
-</html>
 )rawliteral";
 
+  html += "<div class=\"card\"><h2>Найденные устройства</h2>";
+  if (bleDevices.empty()) {
+    html += "<p class=\"muted\">Список пуст. Нажми сканирование.</p>";
+  } else {
+    html += "<table><tr><th>Device</th><th>RSSI</th><th>Advertised service</th><th>Action</th></tr>";
+    for (const auto& device : bleDevices) {
+      html += "<tr><td><b>" + htmlEscape(device.name) + "</b><br><code>" + htmlEscape(device.address) + "</code></td>";
+      html += "<td>" + String(device.rssi) + " dBm</td><td><code>" + htmlEscape(device.serviceUuid) + "</code></td><td>";
+      html += "<form method=\"POST\" action=\"/bt-connect-discover\"><input type=\"hidden\" name=\"addr\" value=\"" + htmlEscape(device.address) + "\"><button type=\"submit\">Подключиться и найти UUID</button></form>";
+      html += "<form method=\"POST\" action=\"/bt-connect-manual\"><input type=\"hidden\" name=\"addr\" value=\"" + htmlEscape(device.address) + "\"><label>Service UUID</label><input name=\"service\" value=\"" + String(DEFAULT_SERVICE_UUID) + "\"><label>Characteristic UUID</label><input name=\"char\" value=\"" + String(DEFAULT_CHAR_UUID) + "\"><button type=\"submit\">Manual UUID connect</button></form>";
+      html += "</td></tr>";
+    }
+    html += "</table>";
+  }
+  html += R"rawliteral(</div></body></html>)rawliteral";
   return html;
 }
 
 static void handleBluetoothPage() {
-  if (setupMode) {
-    server.send(403, "text/plain; charset=utf-8", "Bluetooth console is disabled in setup mode");
-    return;
-  }
-
+  if (setupMode) { server.send(403, "text/plain; charset=utf-8", "Bluetooth console is disabled in setup mode"); return; }
   server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
 }
 
 static void handleBluetoothScan() {
-  if (setupMode) {
-    server.send(403, "text/plain; charset=utf-8", "Bluetooth scan is disabled in setup mode");
-    return;
-  }
-
+  if (setupMode) { server.send(403, "text/plain; charset=utf-8", "Bluetooth scan is disabled in setup mode"); return; }
   scanBleDevices();
   server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
 }
 
-static void handleBluetoothConnect() {
-  if (setupMode) {
-    server.send(403, "text/plain; charset=utf-8", "Bluetooth connect is disabled in setup mode");
-    return;
-  }
+static void handleBluetoothConnectDiscover() {
+  String address = server.arg("addr"); address.trim();
+  connectAndDiscover(address);
+  server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
+}
 
-  String address = server.arg("addr");
-  String serviceUuid = server.arg("service");
-  String characteristicUuid = server.arg("char");
+static void handleBluetoothConnectManual() {
+  String address = server.arg("addr"); address.trim();
+  String serviceUuid = server.arg("service"); serviceUuid.trim();
+  String characteristicUuid = server.arg("char"); characteristicUuid.trim();
 
-  address.trim();
-  serviceUuid.trim();
-  characteristicUuid.trim();
+  if (address.length() > 0) connectManual(address, serviceUuid, characteristicUuid);
+  else selectCharacteristic(serviceUuid, characteristicUuid);
 
-  connectBle(address, serviceUuid, characteristicUuid);
+  server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
+}
+
+static void handleBluetoothDiscover() {
+  discoverGatt();
+  server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
+}
+
+static void handleBluetoothSelect() {
+  String serviceUuid = server.arg("service"); serviceUuid.trim();
+  String characteristicUuid = server.arg("char"); characteristicUuid.trim();
+  selectCharacteristic(serviceUuid, characteristicUuid);
   server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
 }
 
 static void handleBluetoothDisconnect() {
-  disconnectBle();
-  bleLastError = "";
-  bleLastRead = "";
-  bleLastWrite = "";
+  disconnectBle(); bleLastError = ""; bleLastRead = ""; bleLastWrite = "";
   server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
 }
 
 static void handleBluetoothSend() {
-  String data = server.arg("data");
-  bool hexMode = server.hasArg("hex");
-
-  writeBle(data, hexMode);
+  writeBle(server.arg("data"), server.hasArg("hex"));
   server.send(200, "text/html; charset=utf-8", makeBluetoothPage());
 }
 
@@ -462,7 +520,10 @@ static void handleBluetoothRead() {
 void registerBluetoothRoutes() {
   server.on("/bluetooth", HTTP_GET, handleBluetoothPage);
   server.on("/bt-scan", HTTP_GET, handleBluetoothScan);
-  server.on("/bt-connect", HTTP_POST, handleBluetoothConnect);
+  server.on("/bt-connect-discover", HTTP_POST, handleBluetoothConnectDiscover);
+  server.on("/bt-connect-manual", HTTP_POST, handleBluetoothConnectManual);
+  server.on("/bt-discover", HTTP_GET, handleBluetoothDiscover);
+  server.on("/bt-select", HTTP_POST, handleBluetoothSelect);
   server.on("/bt-disconnect", HTTP_POST, handleBluetoothDisconnect);
   server.on("/bt-send", HTTP_POST, handleBluetoothSend);
   server.on("/bt-read", HTTP_GET, handleBluetoothRead);
