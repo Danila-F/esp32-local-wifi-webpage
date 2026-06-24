@@ -6,13 +6,13 @@
 #include <Preferences.h>
 #include <Update.h>
 
+#include "bluetooth_web.h"
+
 #define LED_PIN 2
 #define RESET_BUTTON_PIN 0
 
 static const byte DNS_PORT = 53;
-
 static const char SETUP_AP_PASSWORD[] = "esp32setup";
-
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long RESET_BUTTON_HOLD_MS = 5000;
 
@@ -22,17 +22,17 @@ Preferences preferences;
 
 bool setupMode = false;
 String setupReason;
-bool otaUpdateOk = false;
 
-unsigned long resetButtonPressedAt = 0;
-bool resetButtonHandled = false;
+static bool otaUpdateOk = false;
+static unsigned long resetButtonPressedAt = 0;
+static bool resetButtonHandled = false;
 
 String htmlEscape(const String& value) {
   String result;
+  result.reserve(value.length());
 
   for (size_t i = 0; i < value.length(); i++) {
     char c = value[i];
-
     switch (c) {
       case '&': result += "&amp;"; break;
       case '<': result += "&lt;"; break;
@@ -46,13 +46,25 @@ String htmlEscape(const String& value) {
   return result;
 }
 
+String css() {
+  return R"rawliteral(
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 32px; background: #f5f5f5; color: #222; }
+    .card { max-width: 760px; margin: 0 auto; padding: 24px; border-radius: 16px; background: white; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    label { display: block; margin: 16px 0 6px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #bbb; border-radius: 10px; font-size: 16px; }
+    button, .button { display: inline-block; margin-top: 18px; padding: 12px 16px; border: 0; border-radius: 10px; background: #222; color: white; font-size: 16px; text-decoration: none; cursor: pointer; }
+    .secondary { background: #eee; color: #222; }
+    code { background: #eee; padding: 2px 6px; border-radius: 6px; }
+    .muted { color: #666; }
+    .warning { color: #9a4b00; }
+  )rawliteral";
+}
+
 String makeSetupApName() {
   uint64_t mac = ESP.getEfuseMac();
   uint16_t suffix = (uint16_t)(mac & 0xFFFF);
-
   char buffer[32];
   snprintf(buffer, sizeof(buffer), "ESP32-Setup-%04X", suffix);
-
   return String(buffer);
 }
 
@@ -65,19 +77,18 @@ void blinkLed(int count, int delayMs) {
   }
 }
 
-bool loadWiFiCredentials(String& ssid, String& password) {
+bool loadWiFiCredentials(String& ssid, String& pass) {
   preferences.begin("wifi", true);
   ssid = preferences.getString("ssid", "");
-  password = preferences.getString("password", "");
+  pass = preferences.getString("password", "");
   preferences.end();
-
   return ssid.length() > 0;
 }
 
-void saveWiFiCredentials(const String& ssid, const String& password) {
+void saveWiFiCredentials(const String& ssid, const String& pass) {
   preferences.begin("wifi", false);
   preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
+  preferences.putString("password", pass);
   preferences.end();
 }
 
@@ -87,231 +98,57 @@ void clearWiFiCredentials() {
   preferences.end();
 }
 
-String css() {
-  return R"rawliteral(
-    body {
-      font-family: system-ui, sans-serif;
-      margin: 0;
-      padding: 32px;
-      background: #f5f5f5;
-      color: #222;
-    }
-    .card {
-      max-width: 720px;
-      margin: 0 auto;
-      padding: 24px;
-      border-radius: 16px;
-      background: white;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
-    }
-    label {
-      display: block;
-      margin: 16px 0 6px;
-      font-weight: 600;
-    }
-    input {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 12px;
-      border: 1px solid #bbb;
-      border-radius: 10px;
-      font-size: 16px;
-    }
-    button, .button {
-      display: inline-block;
-      margin-top: 18px;
-      padding: 12px 16px;
-      border: 0;
-      border-radius: 10px;
-      background: #222;
-      color: white;
-      font-size: 16px;
-      text-decoration: none;
-      cursor: pointer;
-    }
-    .secondary {
-      background: #eee;
-      color: #222;
-    }
-    code {
-      background: #eee;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }
-    .muted {
-      color: #666;
-    }
-    .warning {
-      color: #9a4b00;
-    }
-  )rawliteral";
+String pageWrap(const String& title, const String& body) {
+  String html = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>";
+  html += title;
+  html += "</title><style>" + css() + "</style></head><body><div class=\"card\">" + body + "</div></body></html>";
+  return html;
 }
 
 String makeSetupPage() {
-  String html = R"rawliteral(
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Wi-Fi Setup</title>
-  <style>
-)rawliteral";
-
-  html += css();
-
-  html += R"rawliteral(
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Настройка Wi-Fi для ESP32</h1>
-)rawliteral";
-
-  html += "<p class=\"muted\">Причина запуска режима настройки: <code>";
-  html += htmlEscape(setupReason);
-  html += "</code></p>";
-
-  html += R"rawliteral(
-    <p>Введите имя и пароль Wi-Fi сети. После сохранения ESP32 перезагрузится и попробует подключиться к этой сети.</p>
-
-    <form method="POST" action="/save">
-      <label for="ssid">SSID / имя Wi-Fi сети</label>
-      <input id="ssid" name="ssid" required autocomplete="off">
-
-      <label for="password">Пароль Wi-Fi</label>
-      <input id="password" name="password" type="password" autocomplete="current-password">
-
-      <button type="submit">Сохранить и перезагрузить</button>
-    </form>
-
-    <p class="muted">ESP32 подключается только к 2.4 GHz Wi-Fi. К 5 GHz-only сети она не подключится.</p>
-    <p><a class="button secondary" href="/status">Статус</a></p>
-  </div>
-</body>
-</html>
-)rawliteral";
-
-  return html;
+  String body = "<h1>Настройка Wi-Fi для ESP32</h1>";
+  body += "<p class=\"muted\">Причина запуска режима настройки: <code>" + htmlEscape(setupReason) + "</code></p>";
+  body += "<p>Введите имя и пароль Wi-Fi сети. После сохранения ESP32 перезагрузится и попробует подключиться к этой сети.</p>";
+  body += "<form method=\"POST\" action=\"/save\"><label for=\"ssid\">SSID / имя Wi-Fi сети</label><input id=\"ssid\" name=\"ssid\" required autocomplete=\"off\">";
+  body += "<label for=\"password\">Пароль Wi-Fi</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\">";
+  body += "<button type=\"submit\">Сохранить и перезагрузить</button></form>";
+  body += "<p class=\"muted\">ESP32 подключается только к 2.4 GHz Wi-Fi.</p><p><a class=\"button secondary\" href=\"/status\">Статус</a></p>";
+  return pageWrap("ESP32 Wi-Fi Setup", body);
 }
 
 String makeMainPage() {
-  String html = R"rawliteral(
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 Web Server</title>
-  <style>
-)rawliteral";
-
-  html += css();
-
-  html += R"rawliteral(
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>ESP32 работает</h1>
-    <p>Устройство подключено к Wi-Fi и отдаёт эту страницу из локальной сети.</p>
-)rawliteral";
-
-  html += "<p><b>IP ESP32:</b> <code>" + WiFi.localIP().toString() + "</code></p>";
-  html += "<p><b>RSSI:</b> <code>" + String(WiFi.RSSI()) + " dBm</code></p>";
-  html += "<p><b>Uptime:</b> <code>" + String(millis() / 1000) + " s</code></p>";
-
-  html += R"rawliteral(
-    <p><a class="button secondary" href="/status">JSON статус</a></p>
-    <p><a class="button secondary" href="/ota">OTA обновление прошивки</a></p>
-    <p><a class="button secondary" href="/reset-wifi" onclick="return confirm('Стереть Wi-Fi настройки и перезагрузить ESP32?')">Стереть Wi-Fi настройки</a></p>
-
-    <p class="muted">
-      Также можно стереть настройки, удерживая кнопку IO0/BOOT около 5 секунд после обычного запуска ESP32.
-      Не держи IO0 во время нажатия EN, иначе плата уйдёт в bootloader mode.
-    </p>
-  </div>
-</body>
-</html>
-)rawliteral";
-
-  return html;
+  String body = "<h1>ESP32 работает</h1><p>Устройство подключено к Wi-Fi и отдаёт эту страницу из локальной сети.</p>";
+  body += "<p><b>IP ESP32:</b> <code>" + WiFi.localIP().toString() + "</code></p>";
+  body += "<p><b>RSSI:</b> <code>" + String(WiFi.RSSI()) + " dBm</code></p>";
+  body += "<p><b>Uptime:</b> <code>" + String(millis() / 1000) + " s</code></p>";
+  body += "<p><a class=\"button secondary\" href=\"/status\">JSON статус</a></p>";
+  body += "<p><a class=\"button secondary\" href=\"/ota\">OTA обновление прошивки</a></p>";
+  body += "<p><a class=\"button secondary\" href=\"/bluetooth\">Bluetooth / BLE console</a></p>";
+  body += "<p><a class=\"button secondary\" href=\"/reset-wifi\" onclick=\"return confirm('Стереть Wi-Fi настройки и перезагрузить ESP32?')\">Стереть Wi-Fi настройки</a></p>";
+  body += "<p class=\"muted\">Для сброса настроек также можно удерживать IO0/BOOT около 5 секунд после обычного запуска.</p>";
+  return pageWrap("ESP32 Web Server", body);
 }
 
 String makeOtaPage() {
-  String html = R"rawliteral(
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP32 OTA Update</title>
-  <style>
-)rawliteral";
-
-  html += css();
-
-  html += R"rawliteral(
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>OTA обновление ESP32</h1>
-
-    <p>Выбери файл <code>firmware.bin</code>, собранный GitHub Actions.</p>
-
-    <p class="warning">
-      Не загружай сюда <code>merged-flash.bin</code>. Он предназначен для полной прошивки через USB/UART по адресу <code>0x0</code>.
-    </p>
-
-    <form method="POST" action="/update" enctype="multipart/form-data">
-      <label for="firmware">Файл прошивки</label>
-      <input id="firmware" name="firmware" type="file" accept=".bin" required>
-
-      <button type="submit">Загрузить и установить</button>
-    </form>
-
-    <p><a class="button secondary" href="/">Назад</a></p>
-  </div>
-</body>
-</html>
-)rawliteral";
-
-  return html;
+  String body = "<h1>OTA обновление ESP32</h1><p>Выбери файл <code>firmware.bin</code>, собранный GitHub Actions.</p>";
+  body += "<p class=\"warning\">Не загружай сюда <code>merged-flash.bin</code>. Он нужен для полной прошивки через USB/UART.</p>";
+  body += "<form method=\"POST\" action=\"/update\" enctype=\"multipart/form-data\"><label for=\"firmware\">Файл прошивки</label><input id=\"firmware\" name=\"firmware\" type=\"file\" accept=\".bin\" required><button type=\"submit\">Загрузить и установить</button></form>";
+  body += "<p><a class=\"button secondary\" href=\"/\">Назад</a></p>";
+  return pageWrap("ESP32 OTA Update", body);
 }
 
-void handleSetupRoot() {
-  server.send(200, "text/html; charset=utf-8", makeSetupPage());
-}
+void handleSetupRoot() { server.send(200, "text/html; charset=utf-8", makeSetupPage()); }
 
 void handleSaveWiFi() {
-  if (!server.hasArg("ssid")) {
-    server.send(400, "text/plain; charset=utf-8", "Missing ssid");
-    return;
-  }
-
   String ssid = server.arg("ssid");
-  String password = server.arg("password");
-
+  String pass = server.arg("password");
   ssid.trim();
-
   if (ssid.length() == 0) {
     server.send(400, "text/plain; charset=utf-8", "SSID is empty");
     return;
   }
-
-  saveWiFiCredentials(ssid, password);
-
-  server.send(
-    200,
-    "text/html; charset=utf-8",
-    "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
-    "<h1>Wi-Fi настройки сохранены</h1>"
-    "<p>ESP32 перезагрузится через несколько секунд.</p>"
-    "</html>"
-  );
-
-  Serial.println("Wi-Fi credentials saved. Restarting...");
+  saveWiFiCredentials(ssid, pass);
+  server.send(200, "text/html; charset=utf-8", pageWrap("Saved", "<h1>Wi-Fi настройки сохранены</h1><p>ESP32 перезагрузится через несколько секунд.</p>"));
   delay(1500);
   ESP.restart();
 }
@@ -328,104 +165,45 @@ void handleOtaPage() {
     server.send(403, "text/plain; charset=utf-8", "OTA update is disabled in setup mode");
     return;
   }
-
   server.send(200, "text/html; charset=utf-8", makeOtaPage());
 }
 
 void handleOtaUpload() {
   HTTPUpload& upload = server.upload();
-
   if (upload.status == UPLOAD_FILE_START) {
     otaUpdateOk = false;
-
-    Serial.println();
-    Serial.print("OTA update started. File: ");
-    Serial.println(upload.filename);
-
     digitalWrite(LED_PIN, HIGH);
-
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-      Serial.println("Update.begin() failed");
-      Update.printError(Serial);
-    }
-  }
-
-  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (!Update.hasError()) {
       size_t written = Update.write(upload.buf, upload.currentSize);
-
-      if (written != upload.currentSize) {
-        Serial.println("Update.write() failed");
-        Update.printError(Serial);
-      }
+      if (written != upload.currentSize) Update.printError(Serial);
     }
-  }
-
-  else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) {
-      otaUpdateOk = true;
-
-      Serial.println();
-      Serial.print("OTA update finished. Size: ");
-      Serial.print(upload.totalSize);
-      Serial.println(" bytes");
-    } else {
-      otaUpdateOk = false;
-
-      Serial.println();
-      Serial.println("Update.end() failed");
-      Update.printError(Serial);
-    }
-
+  } else if (upload.status == UPLOAD_FILE_END) {
+    otaUpdateOk = Update.end(true);
+    if (!otaUpdateOk) Update.printError(Serial);
     digitalWrite(LED_PIN, LOW);
-  }
-
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
     otaUpdateOk = false;
     Update.abort();
-
-    Serial.println();
-    Serial.println("OTA update aborted");
-
     digitalWrite(LED_PIN, LOW);
   }
 }
 
 void handleOtaFinished() {
   server.sendHeader("Connection", "close");
-
   if (otaUpdateOk) {
-    server.send(
-      200,
-      "text/html; charset=utf-8",
-      "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
-      "<h1>OTA обновление успешно</h1>"
-      "<p>ESP32 перезагрузится через несколько секунд.</p>"
-      "</html>"
-    );
-
-    Serial.println("Restarting after OTA update...");
+    server.send(200, "text/html; charset=utf-8", pageWrap("OTA OK", "<h1>OTA обновление успешно</h1><p>ESP32 перезагрузится через несколько секунд.</p>"));
     delay(1500);
     ESP.restart();
   } else {
-    server.send(
-      500,
-      "text/html; charset=utf-8",
-      "<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\">"
-      "<h1>OTA обновление не удалось</h1>"
-      "<p>Проверь Serial Monitor для подробностей.</p>"
-      "<p>Убедись, что загружаешь именно firmware.bin, а не merged-flash.bin.</p>"
-      "<p><a href=\"/ota\">Назад</a></p>"
-      "</html>"
-    );
+    server.send(500, "text/html; charset=utf-8", pageWrap("OTA failed", "<h1>OTA обновление не удалось</h1><p>Проверь Serial Monitor. Загружать нужно firmware.bin.</p><p><a href=\"/ota\">Назад</a></p>"));
   }
 }
 
 void handleStatus() {
   String json = "{";
-  json += "\"mode\":\"";
-  json += setupMode ? "setup" : "normal";
-  json += "\",";
+  json += "\"mode\":\"" + String(setupMode ? "setup" : "normal") + "\",";
   json += "\"wifi_status\":" + String((int)WiFi.status()) + ",";
   json += "\"local_ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"soft_ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -435,13 +213,11 @@ void handleStatus() {
   json += "\"free_sketch_space\":" + String(ESP.getFreeSketchSpace()) + ",";
   json += "\"uptime_ms\":" + String(millis());
   json += "}";
-
   server.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleResetWiFi() {
   server.send(200, "text/plain; charset=utf-8", "Wi-Fi credentials cleared. Restarting ESP32...");
-  Serial.println("Clearing Wi-Fi credentials by HTTP request...");
   clearWiFiCredentials();
   delay(1000);
   ESP.restart();
@@ -456,16 +232,10 @@ void handleNotFound() {
   }
 }
 
-bool connectToWiFi(const String& ssid, const String& password, unsigned long timeoutMs) {
-  Serial.println();
-  Serial.println("Connecting to saved Wi-Fi...");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-
+bool connectToWiFi(const String& ssid, const String& pass, unsigned long timeoutMs) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("esp32-web-test");
-  WiFi.begin(ssid.c_str(), password.c_str());
-
+  WiFi.begin(ssid.c_str(), pass.c_str());
   unsigned long startTime = millis();
 
   while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeoutMs) {
@@ -473,126 +243,69 @@ bool connectToWiFi(const String& ssid, const String& password, unsigned long tim
     Serial.print(".");
     delay(500);
   }
-
   digitalWrite(LED_PIN, LOW);
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Wi-Fi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-    Serial.print("RSSI: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-
     return true;
   }
-
-  Serial.println("Wi-Fi connection failed");
   return false;
 }
 
 void startMainServer() {
   setupMode = false;
-
-  if (MDNS.begin("esp32-test")) {
-    Serial.println("mDNS started: http://esp32-test.local/");
-  } else {
-    Serial.println("mDNS failed");
-  }
-
+  MDNS.begin("esp32-test");
   server.on("/", HTTP_GET, handleMainRoot);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/ota", HTTP_GET, handleOtaPage);
   server.on("/update", HTTP_POST, handleOtaFinished, handleOtaUpload);
   server.on("/reset-wifi", HTTP_GET, handleResetWiFi);
+  registerBluetoothRoutes();
   server.onNotFound(handleNotFound);
-
   server.begin();
-
-  Serial.println("HTTP server started");
   Serial.print("Open in browser: http://");
   Serial.print(WiFi.localIP());
   Serial.println("/");
-  Serial.print("OTA page: http://");
+  Serial.print("Bluetooth page: http://");
   Serial.print(WiFi.localIP());
-  Serial.println("/ota");
+  Serial.println("/bluetooth");
 }
 
 void startSetupPortal(const String& reason) {
   setupMode = true;
   setupReason = reason;
-
   WiFi.disconnect();
   delay(200);
-
   WiFi.mode(WIFI_AP);
-
   String apSsid = makeSetupApName();
-
-  bool apStarted;
-
-  if (strlen(SETUP_AP_PASSWORD) >= 8) {
-    apStarted = WiFi.softAP(apSsid.c_str(), SETUP_AP_PASSWORD);
-  } else {
-    apStarted = WiFi.softAP(apSsid.c_str());
-  }
-
-  if (!apStarted) {
-    Serial.println("Failed to start setup AP. Restarting...");
-    delay(1000);
-    ESP.restart();
-  }
-
+  bool apStarted = strlen(SETUP_AP_PASSWORD) >= 8 ? WiFi.softAP(apSsid.c_str(), SETUP_AP_PASSWORD) : WiFi.softAP(apSsid.c_str());
+  if (!apStarted) ESP.restart();
   IPAddress apIp = WiFi.softAPIP();
-
   dnsServer.start(DNS_PORT, "*", apIp);
-
   server.on("/", HTTP_GET, handleSetupRoot);
   server.on("/save", HTTP_POST, handleSaveWiFi);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/reset-wifi", HTTP_GET, handleResetWiFi);
   server.onNotFound(handleNotFound);
-
   server.begin();
-
-  Serial.println();
-  Serial.println("Setup portal started");
-  Serial.print("Reason: ");
-  Serial.println(setupReason);
-  Serial.print("AP SSID: ");
-  Serial.println(apSsid);
-
-  if (strlen(SETUP_AP_PASSWORD) >= 8) {
-    Serial.print("AP password: ");
-    Serial.println(SETUP_AP_PASSWORD);
-  } else {
-    Serial.println("AP password: <open network>");
-  }
-
-  Serial.print("Setup URL: http://");
-  Serial.print(apIp);
-  Serial.println("/");
+  Serial.print("AP SSID: "); Serial.println(apSsid);
+  Serial.print("AP password: "); Serial.println(SETUP_AP_PASSWORD);
+  Serial.print("Setup URL: http://"); Serial.print(apIp); Serial.println("/");
 }
 
 void checkResetButton() {
   bool pressed = digitalRead(RESET_BUTTON_PIN) == LOW;
-
   if (pressed) {
     if (resetButtonPressedAt == 0) {
       resetButtonPressedAt = millis();
       resetButtonHandled = false;
     }
-
     if (!resetButtonHandled && millis() - resetButtonPressedAt >= RESET_BUTTON_HOLD_MS) {
       resetButtonHandled = true;
-
-      Serial.println();
-      Serial.println("BOOT/IO0 long press detected. Clearing Wi-Fi credentials...");
       clearWiFiCredentials();
-
       blinkLed(5, 120);
-
       ESP.restart();
     }
   } else {
@@ -604,57 +317,34 @@ void checkResetButton() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
-
-  Serial.println();
-  Serial.println("ESP32 Wi-Fi provisioning web server started");
+  Serial.println("ESP32 Wi-Fi + OTA + BLE web server started");
 
   String ssid;
-  String password;
-
-  if (loadWiFiCredentials(ssid, password)) {
-    if (connectToWiFi(ssid, password, WIFI_CONNECT_TIMEOUT_MS)) {
-      startMainServer();
-    } else {
-      startSetupPortal("Saved Wi-Fi credentials failed");
-    }
+  String pass;
+  if (loadWiFiCredentials(ssid, pass)) {
+    if (connectToWiFi(ssid, pass, WIFI_CONNECT_TIMEOUT_MS)) startMainServer();
+    else startSetupPortal("Saved Wi-Fi credentials failed");
   } else {
     startSetupPortal("No saved Wi-Fi credentials");
   }
 }
 
 void loop() {
-  if (setupMode) {
-    dnsServer.processNextRequest();
-  }
-
+  if (setupMode) dnsServer.processNextRequest();
   server.handleClient();
   checkResetButton();
 
   static unsigned long lastWiFiCheck = 0;
   static unsigned long disconnectedSince = 0;
-
   if (!setupMode && millis() - lastWiFiCheck > 5000) {
     lastWiFiCheck = millis();
-
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Wi-Fi disconnected. Trying to reconnect...");
-
-      if (disconnectedSince == 0) {
-        disconnectedSince = millis();
-      }
-
+      if (disconnectedSince == 0) disconnectedSince = millis();
       WiFi.reconnect();
-
-      if (millis() - disconnectedSince > 60000) {
-        Serial.println("Wi-Fi was disconnected for too long. Restarting...");
-        delay(1000);
-        ESP.restart();
-      }
+      if (millis() - disconnectedSince > 60000) ESP.restart();
     } else {
       disconnectedSince = 0;
     }
