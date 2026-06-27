@@ -7,6 +7,7 @@ on:
       - main
       - master
       - ota-update
+      - ir-uart-module
 
 jobs:
   build:
