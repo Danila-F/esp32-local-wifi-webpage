@@ -30,6 +30,7 @@ static const uint8_t IR_MODULE_ADDRESS = 0xA1;
 static const uint8_t IR_SEND_COMMAND = 0xF1;
 static const unsigned long IR_ACK_TIMEOUT_MS = 500;
 static const unsigned long IR_RX_FRAME_GAP_MS = 100;
+static const uint8_t MAX_SAVED_IR_COMMANDS = 16;
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -52,6 +53,17 @@ bool irLastCodeValid = false;
 unsigned long irLastCodeAt = 0;
 unsigned long irReceivedFrameCount = 0;
 
+struct IrAppCode {
+  uint8_t app[4] = {0, 0, 0, 0};
+  uint8_t module[3] = {0, 0, 0};
+  String normalized;
+};
+
+struct SavedIrCommand {
+  String name;
+  String appCode;
+};
+
 String htmlEscape(const String& value) {
   String result;
 
@@ -65,6 +77,35 @@ String htmlEscape(const String& value) {
       case '"': result += "&quot;"; break;
       case '\'': result += "&#39;"; break;
       default: result += c; break;
+    }
+  }
+
+  return result;
+}
+
+String jsonEscape(const String& value) {
+  String result;
+
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+
+    switch (c) {
+      case '"': result += "\\\""; break;
+      case '\\': result += "\\\\"; break;
+      case '\b': result += "\\b"; break;
+      case '\f': result += "\\f"; break;
+      case '\n': result += "\\n"; break;
+      case '\r': result += "\\r"; break;
+      case '\t': result += "\\t"; break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char buffer[7];
+          snprintf(buffer, sizeof(buffer), "\\u%04X", c);
+          result += buffer;
+        } else {
+          result += c;
+        }
+        break;
     }
   }
 
@@ -91,6 +132,23 @@ String makeIrCodeString(const uint8_t* data, size_t length) {
   return result;
 }
 
+String makeAppCodeString(const uint8_t* data) {
+  String result;
+
+  for (size_t i = 0; i < 4; i++) {
+    result += byteToHex(data[i]);
+  }
+
+  return result;
+}
+
+uint8_t reverseBits(uint8_t value) {
+  value = (value & 0xF0) >> 4 | (value & 0x0F) << 4;
+  value = (value & 0xCC) >> 2 | (value & 0x33) << 2;
+  value = (value & 0xAA) >> 1 | (value & 0x55) << 1;
+  return value;
+}
+
 bool parseHexByte(String value, uint8_t& output) {
   value.trim();
   value.toUpperCase();
@@ -110,6 +168,140 @@ bool parseHexByte(String value, uint8_t& output) {
   }
 
   output = (uint8_t)strtoul(value.c_str(), nullptr, 16);
+  return true;
+}
+
+bool parseAppIrCode(String input, IrAppCode& output, String& error) {
+  input.trim();
+  input.toUpperCase();
+
+  String hex;
+
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+
+    if (isxdigit((unsigned char)c)) {
+      hex += (char)toupper((unsigned char)c);
+    } else if (c == ' ' || c == '-' || c == '_' || c == ':' || c == ',') {
+      continue;
+    } else {
+      error = "В коде приложения допустимы только hex-цифры и разделители: пробел, -, _, :, запятая.";
+      return false;
+    }
+  }
+
+  if (hex.length() != 8) {
+    error = "Код приложения должен содержать ровно 8 hex-символов, например 00FFA25D.";
+    return false;
+  }
+
+  for (uint8_t i = 0; i < 4; i++) {
+    String byteText = hex.substring(i * 2, i * 2 + 2);
+    output.app[i] = (uint8_t)strtoul(byteText.c_str(), nullptr, 16);
+  }
+
+  if ((uint8_t)(output.app[2] ^ output.app[3]) != 0xFF) {
+    error = "Некорректный NEC-код: 4-й байт должен быть инверсией 3-го.";
+    return false;
+  }
+
+  output.module[0] = reverseBits(output.app[0]);
+  output.module[1] = reverseBits(output.app[1]);
+  output.module[2] = reverseBits(output.app[2]);
+  output.normalized = makeAppCodeString(output.app);
+
+  return true;
+}
+
+String moduleFullNecString(const uint8_t* moduleData) {
+  uint8_t fullCode[4] = {
+    moduleData[0],
+    moduleData[1],
+    moduleData[2],
+    (uint8_t)~moduleData[2]
+  };
+
+  return makeIrCodeString(fullCode, 4);
+}
+
+String savedCommandNameKey(uint8_t index) {
+  return "name" + String(index);
+}
+
+String savedCommandCodeKey(uint8_t index) {
+  return "code" + String(index);
+}
+
+uint8_t getSavedIrCommandCount() {
+  preferences.begin("ircodes", true);
+  uint8_t count = (uint8_t)preferences.getUChar("count", 0);
+  preferences.end();
+
+  if (count > MAX_SAVED_IR_COMMANDS) {
+    count = MAX_SAVED_IR_COMMANDS;
+  }
+
+  return count;
+}
+
+bool loadSavedIrCommand(uint8_t index, SavedIrCommand& command) {
+  preferences.begin("ircodes", true);
+  uint8_t count = (uint8_t)preferences.getUChar("count", 0);
+
+  if (index >= count || index >= MAX_SAVED_IR_COMMANDS) {
+    preferences.end();
+    return false;
+  }
+
+  command.name = preferences.getString(savedCommandNameKey(index).c_str(), "");
+  command.appCode = preferences.getString(savedCommandCodeKey(index).c_str(), "");
+  preferences.end();
+
+  return command.appCode.length() > 0;
+}
+
+bool addSavedIrCommand(const String& name, const String& appCode, String& error) {
+  uint8_t count = getSavedIrCommandCount();
+
+  if (count >= MAX_SAVED_IR_COMMANDS) {
+    error = "Достигнут лимит сохранённых команд: " + String(MAX_SAVED_IR_COMMANDS) + ".";
+    return false;
+  }
+
+  preferences.begin("ircodes", false);
+  preferences.putString(savedCommandNameKey(count).c_str(), name);
+  preferences.putString(savedCommandCodeKey(count).c_str(), appCode);
+  preferences.putUChar("count", count + 1);
+  preferences.end();
+
+  return true;
+}
+
+bool deleteSavedIrCommand(uint8_t index) {
+  preferences.begin("ircodes", false);
+  uint8_t count = (uint8_t)preferences.getUChar("count", 0);
+
+  if (index >= count || index >= MAX_SAVED_IR_COMMANDS) {
+    preferences.end();
+    return false;
+  }
+
+  for (uint8_t i = index; i + 1 < count; i++) {
+    String nextName = preferences.getString(savedCommandNameKey(i + 1).c_str(), "");
+    String nextCode = preferences.getString(savedCommandCodeKey(i + 1).c_str(), "");
+
+    preferences.putString(savedCommandNameKey(i).c_str(), nextName);
+    preferences.putString(savedCommandCodeKey(i).c_str(), nextCode);
+  }
+
+  if (count > 0) {
+    uint8_t last = count - 1;
+    preferences.remove(savedCommandNameKey(last).c_str());
+    preferences.remove(savedCommandCodeKey(last).c_str());
+    preferences.putUChar("count", last);
+  }
+
+  preferences.end();
   return true;
 }
 
@@ -159,7 +351,7 @@ void clearIrState() {
   }
 }
 
-bool sendIrNecCommand(uint8_t data1, uint8_t data2, uint8_t data3, bool& ackReceived, uint8_t& firstResponseByte) {
+bool sendIrNecCommand(uint8_t data1, uint8_t data2, uint8_t data3, bool& ackReceived, bool& hasFirstResponseByte, uint8_t& firstResponseByte) {
   uint8_t packet[5] = {
     IR_MODULE_ADDRESS,
     IR_SEND_COMMAND,
@@ -172,6 +364,7 @@ bool sendIrNecCommand(uint8_t data1, uint8_t data2, uint8_t data3, bool& ackRece
   irPendingIndex = 0;
 
   ackReceived = false;
+  hasFirstResponseByte = false;
   firstResponseByte = 0;
 
   IrSerial.write(packet, sizeof(packet));
@@ -183,7 +376,8 @@ bool sendIrNecCommand(uint8_t data1, uint8_t data2, uint8_t data3, bool& ackRece
     if (IrSerial.available()) {
       uint8_t value = (uint8_t)IrSerial.read();
 
-      if (firstResponseByte == 0) {
+      if (!hasFirstResponseByte) {
+        hasFirstResponseByte = true;
         firstResponseByte = value;
       }
 
@@ -199,6 +393,26 @@ bool sendIrNecCommand(uint8_t data1, uint8_t data2, uint8_t data3, bool& ackRece
   }
 
   return false;
+}
+
+String makeIrSendResultMessage(const uint8_t* moduleData, bool ackReceived, bool hasFirstResponseByte, uint8_t firstResponseByte) {
+  String message = "Отправлен UART-пакет A1 F1 ";
+  message += makeIrCodeString(moduleData, 3);
+  message += ". ИК-код должен быть ";
+  message += moduleFullNecString(moduleData);
+  message += ". ";
+
+  if (ackReceived) {
+    message += "Модуль ответил ACK F1.";
+  } else if (hasFirstResponseByte) {
+    message += "ACK F1 не получен, первый ответ модуля: ";
+    message += byteToHex(firstResponseByte);
+    message += ".";
+  } else {
+    message += "ACK F1 не получен за время ожидания. Передача могла всё равно сработать, если обратная линия TXD модуля не читается ESP32.";
+  }
+
+  return message;
 }
 
 String makeSetupApName() {
@@ -252,7 +466,7 @@ String css() {
       color: #222;
     }
     .card {
-      max-width: 720px;
+      max-width: 860px;
       margin: 0 auto;
       padding: 24px;
       border-radius: 16px;
@@ -288,6 +502,10 @@ String css() {
       background: #eee;
       color: #222;
     }
+    .danger-button {
+      background: #8a1f11;
+      color: white;
+    }
     code {
       background: #eee;
       padding: 2px 6px;
@@ -310,8 +528,44 @@ String css() {
       grid-template-columns: repeat(3, 1fr);
       gap: 12px;
     }
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .command {
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 14px;
+      margin: 12px 0;
+      background: #fafafa;
+    }
+    .command-title {
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .command-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .command-actions form {
+      margin: 0;
+    }
+    .command-actions button {
+      margin-top: 8px;
+    }
+    hr {
+      border: 0;
+      border-top: 1px solid #ddd;
+      margin: 28px 0;
+    }
     @media (max-width: 600px) {
-      .row {
+      body {
+        padding: 16px;
+      }
+      .row, .two-col {
         grid-template-columns: 1fr;
       }
     }
@@ -392,6 +646,7 @@ String makeMainPage() {
   html += "<p><b>RSSI:</b> <code>" + String(WiFi.RSSI()) + " dBm</code></p>";
   html += "<p><b>Uptime:</b> <code>" + String(millis() / 1000) + " s</code></p>";
   html += "<p><b>IR UART:</b> <code>RX2 GPIO" + String(IR_RX_PIN) + ", TX2 GPIO" + String(IR_TX_PIN) + ", " + String(IR_BAUD_RATE) + " baud</code></p>";
+  html += "<p><b>Сохранённых ИК-команд:</b> <code>" + String(getSavedIrCommandCount()) + "</code></p>";
 
   if (irLastCodeValid) {
     html += "<p><b>Последний принятый ИК-код:</b> <code>";
@@ -417,6 +672,63 @@ String makeMainPage() {
 </body>
 </html>
 )rawliteral";
+
+  return html;
+}
+
+String makeSavedCommandsHtml() {
+  String html;
+  uint8_t count = getSavedIrCommandCount();
+
+  if (count == 0) {
+    return "<p class=\"muted\">Сохранённых команд пока нет.</p>";
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    SavedIrCommand command;
+
+    if (!loadSavedIrCommand(i, command)) {
+      continue;
+    }
+
+    IrAppCode parsed;
+    String error;
+    bool valid = parseAppIrCode(command.appCode, parsed, error);
+
+    html += "<div class=\"command\">";
+    html += "<div class=\"command-title\">";
+    html += htmlEscape(command.name.length() > 0 ? command.name : ("Команда " + String(i + 1)));
+    html += "</div>";
+    html += "<p>Код приложения: <code>" + htmlEscape(command.appCode) + "</code></p>";
+
+    if (valid) {
+      html += "<p>В модуль будет отправлено: <code>";
+      html += makeIrCodeString(parsed.module, 3);
+      html += "</code>; полный NEC от модуля: <code>";
+      html += moduleFullNecString(parsed.module);
+      html += "</code></p>";
+    } else {
+      html += "<p class=\"danger\">Код повреждён или невалиден: ";
+      html += htmlEscape(error);
+      html += "</p>";
+    }
+
+    html += "<div class=\"command-actions\">";
+    html += "<form method=\"POST\" action=\"/ir/run\">";
+    html += "<input type=\"hidden\" name=\"id\" value=\"" + String(i) + "\">";
+    html += "<button type=\"submit\"";
+    if (!valid) {
+      html += " disabled";
+    }
+    html += ">Отправить</button>";
+    html += "</form>";
+    html += "<form method=\"POST\" action=\"/ir/delete\" onsubmit=\"return confirm('Удалить эту ИК-команду?')\">";
+    html += "<input type=\"hidden\" name=\"id\" value=\"" + String(i) + "\">";
+    html += "<button class=\"danger-button\" type=\"submit\">Удалить</button>";
+    html += "</form>";
+    html += "</div>";
+    html += "</div>";
+  }
 
   return html;
 }
@@ -464,7 +776,38 @@ String makeIrPage(const String& message = "", bool success = true) {
       При питании модуля от 3V3 сначала измерь уровни TXD/RXD мультиметром.
     </p>
 
-    <h2>Отправить NEC-команду</h2>
+    <h2>Сохранённые команды</h2>
+)rawliteral";
+
+  html += makeSavedCommandsHtml();
+
+  html += R"rawliteral(
+    <h2>Добавить кнопку из кода приложения</h2>
+    <p class="muted">
+      Введи полный 4-байтовый NEC-код одной строкой, как он был сохранён в приложении телефона: например <code>00FFA25D</code>.
+      ESP32 сама развернёт биты и отправит в модуль нужные 3 байта. Например <code>00FFA25D</code> станет <code>00 FF 45</code>.
+    </p>
+
+    <form method="POST" action="/ir/save">
+      <label for="name">Название кнопки</label>
+      <input id="name" name="name" placeholder="Включить гирлянду" maxlength="40" autocomplete="off">
+
+      <label for="appCode">Код из приложения, 4 байта</label>
+      <input id="appCode" name="appCode" placeholder="00FFA25D" required maxlength="32" autocomplete="off">
+
+      <button type="submit">Сохранить кнопку</button>
+    </form>
+
+    <h2>Отправить код приложения один раз</h2>
+    <form method="POST" action="/ir/send-app">
+      <label for="singleAppCode">Код из приложения, 4 байта</label>
+      <input id="singleAppCode" name="appCode" placeholder="00FFE21D" required maxlength="32" autocomplete="off">
+      <button type="submit">Преобразовать и отправить</button>
+    </form>
+
+    <hr>
+
+    <h2>Ручная отправка в формате модуля</h2>
     <p class="muted">
       Для YS-IRTM-подобного модуля отправляется UART-пакет <code>A1 F1 data1 data2 data3</code>.
       В ИК обычно уходит <code>data1 data2 data3 ~data3</code>.
@@ -580,6 +923,7 @@ String makeIrStatusJson() {
   json += "\"tx_pin\":" + String(IR_TX_PIN) + ",";
   json += "\"module_address\":\"" + byteToHex(IR_MODULE_ADDRESS) + "\",";
   json += "\"send_command\":\"" + byteToHex(IR_SEND_COMMAND) + "\",";
+  json += "\"saved_command_count\":" + String(getSavedIrCommandCount()) + ",";
   json += "\"received_frame_count\":" + String(irReceivedFrameCount) + ",";
   json += "\"has_last_code\":";
   json += irLastCodeValid ? "true" : "false";
@@ -612,6 +956,46 @@ String makeIrStatusJson() {
   json += irLastCodeValid ? String(millis() - irLastCodeAt) : "null";
   json += "}";
 
+  return json;
+}
+
+String makeSavedCommandsJson() {
+  String json = "[";
+  uint8_t count = getSavedIrCommandCount();
+
+  for (uint8_t i = 0; i < count; i++) {
+    SavedIrCommand command;
+
+    if (!loadSavedIrCommand(i, command)) {
+      continue;
+    }
+
+    IrAppCode parsed;
+    String error;
+    bool valid = parseAppIrCode(command.appCode, parsed, error);
+
+    if (i > 0) {
+      json += ",";
+    }
+
+    json += "{";
+    json += "\"id\":" + String(i) + ",";
+    json += "\"name\":\"" + jsonEscape(command.name) + "\",";
+    json += "\"app_code\":\"" + jsonEscape(command.appCode) + "\",";
+    json += "\"valid\":";
+    json += valid ? "true" : "false";
+
+    if (valid) {
+      json += ",\"module_code\":\"" + makeIrCodeString(parsed.module, 3) + "\"";
+      json += ",\"module_full_nec\":\"" + moduleFullNecString(parsed.module) + "\"";
+    } else {
+      json += ",\"error\":\"" + jsonEscape(error) + "\"";
+    }
+
+    json += "}";
+  }
+
+  json += "]";
   return json;
 }
 
@@ -681,36 +1065,138 @@ void handleIrSend() {
   }
 
   bool ackReceived = false;
+  bool hasFirstResponseByte = false;
   uint8_t firstResponseByte = 0;
-  bool ok = sendIrNecCommand(data1, data2, data3, ackReceived, firstResponseByte);
+  sendIrNecCommand(data1, data2, data3, ackReceived, hasFirstResponseByte, firstResponseByte);
 
-  Serial.print("IR send requested: ");
+  Serial.print("IR send requested, module format: ");
   Serial.print(byteToHex(data1));
   Serial.print(" ");
   Serial.print(byteToHex(data2));
   Serial.print(" ");
   Serial.println(byteToHex(data3));
 
-  String message = "Отправлен UART-пакет A1 F1 ";
-  uint8_t data[3] = {data1, data2, data3};
-  message += makeIrCodeString(data, 3);
-  message += ". ИК-код должен быть ";
-  message += makeIrCodeString(data, 3);
-  message += " ";
-  message += byteToHex((uint8_t)~data3);
-  message += ". ";
+  uint8_t moduleData[3] = {data1, data2, data3};
+  server.send(200, "text/html; charset=utf-8", makeIrPage(makeIrSendResultMessage(moduleData, ackReceived, hasFirstResponseByte, firstResponseByte), true));
+}
 
-  if (ok && ackReceived) {
-    message += "Модуль ответил ACK F1.";
-  } else if (firstResponseByte != 0) {
-    message += "ACK F1 не получен, первый ответ модуля: ";
-    message += byteToHex(firstResponseByte);
-    message += ".";
-  } else {
-    message += "ACK F1 не получен за время ожидания. Передача могла всё равно сработать, если линия TXD модуля не подключена к RX2 ESP32.";
+void handleIrSendApp() {
+  if (!server.hasArg("appCode")) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Не передан код приложения.", false));
+    return;
   }
 
-  server.send(200, "text/html; charset=utf-8", makeIrPage(message, ok));
+  IrAppCode code;
+  String error;
+
+  if (!parseAppIrCode(server.arg("appCode"), code, error)) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage(error, false));
+    return;
+  }
+
+  bool ackReceived = false;
+  bool hasFirstResponseByte = false;
+  uint8_t firstResponseByte = 0;
+  sendIrNecCommand(code.module[0], code.module[1], code.module[2], ackReceived, hasFirstResponseByte, firstResponseByte);
+
+  String message = "Код приложения " + code.normalized + " преобразован в " + makeIrCodeString(code.module, 3) + ". ";
+  message += makeIrSendResultMessage(code.module, ackReceived, hasFirstResponseByte, firstResponseByte);
+
+  server.send(200, "text/html; charset=utf-8", makeIrPage(message, true));
+}
+
+void handleIrSave() {
+  if (!server.hasArg("appCode")) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Не передан код приложения.", false));
+    return;
+  }
+
+  String name = server.arg("name");
+  name.trim();
+
+  if (name.length() == 0) {
+    name = "ИК команда";
+  }
+
+  if (name.length() > 40) {
+    name = name.substring(0, 40);
+  }
+
+  IrAppCode code;
+  String error;
+
+  if (!parseAppIrCode(server.arg("appCode"), code, error)) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage(error, false));
+    return;
+  }
+
+  if (!addSavedIrCommand(name, code.normalized, error)) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage(error, false));
+    return;
+  }
+
+  String message = "Сохранена кнопка \"" + name + "\": " + code.normalized + " → " + makeIrCodeString(code.module, 3) + ".";
+  server.send(200, "text/html; charset=utf-8", makeIrPage(message, true));
+}
+
+void handleIrRun() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Не передан id сохранённой команды.", false));
+    return;
+  }
+
+  int id = server.arg("id").toInt();
+
+  if (id < 0 || id >= MAX_SAVED_IR_COMMANDS) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Некорректный id сохранённой команды.", false));
+    return;
+  }
+
+  SavedIrCommand command;
+
+  if (!loadSavedIrCommand((uint8_t)id, command)) {
+    server.send(404, "text/html; charset=utf-8", makeIrPage("Сохранённая команда не найдена.", false));
+    return;
+  }
+
+  IrAppCode code;
+  String error;
+
+  if (!parseAppIrCode(command.appCode, code, error)) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Сохранённая команда повреждена: " + error, false));
+    return;
+  }
+
+  bool ackReceived = false;
+  bool hasFirstResponseByte = false;
+  uint8_t firstResponseByte = 0;
+  sendIrNecCommand(code.module[0], code.module[1], code.module[2], ackReceived, hasFirstResponseByte, firstResponseByte);
+
+  String message = "Выполнена команда \"" + command.name + "\". Код приложения " + code.normalized + " → " + makeIrCodeString(code.module, 3) + ". ";
+  message += makeIrSendResultMessage(code.module, ackReceived, hasFirstResponseByte, firstResponseByte);
+
+  server.send(200, "text/html; charset=utf-8", makeIrPage(message, true));
+}
+
+void handleIrDelete() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Не передан id сохранённой команды.", false));
+    return;
+  }
+
+  int id = server.arg("id").toInt();
+
+  if (id < 0 || id >= MAX_SAVED_IR_COMMANDS) {
+    server.send(400, "text/html; charset=utf-8", makeIrPage("Некорректный id сохранённой команды.", false));
+    return;
+  }
+
+  if (!deleteSavedIrCommand((uint8_t)id)) {
+    server.send(404, "text/html; charset=utf-8", makeIrPage("Сохранённая команда не найдена.", false));
+    return;
+  }
+
+  server.send(200, "text/html; charset=utf-8", makeIrPage("Сохранённая команда удалена.", true));
 }
 
 void handleIrClear() {
@@ -721,6 +1207,10 @@ void handleIrClear() {
 void handleIrReadJson() {
   processIrSerial();
   server.send(200, "application/json; charset=utf-8", makeIrStatusJson());
+}
+
+void handleIrSavedJson() {
+  server.send(200, "application/json; charset=utf-8", makeSavedCommandsJson());
 }
 
 void handleOtaPage() {
@@ -908,8 +1398,13 @@ void startMainServer() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/ir", HTTP_GET, handleIrPage);
   server.on("/ir/send", HTTP_POST, handleIrSend);
+  server.on("/ir/send-app", HTTP_POST, handleIrSendApp);
+  server.on("/ir/save", HTTP_POST, handleIrSave);
+  server.on("/ir/run", HTTP_POST, handleIrRun);
+  server.on("/ir/delete", HTTP_POST, handleIrDelete);
   server.on("/ir/clear", HTTP_POST, handleIrClear);
   server.on("/ir/read", HTTP_GET, handleIrReadJson);
+  server.on("/ir/saved", HTTP_GET, handleIrSavedJson);
   server.on("/ota", HTTP_GET, handleOtaPage);
   server.on("/update", HTTP_POST, handleOtaFinished, handleOtaUpload);
   server.on("/reset-wifi", HTTP_GET, handleResetWiFi);
